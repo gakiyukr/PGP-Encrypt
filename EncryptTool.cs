@@ -25,6 +25,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -87,6 +88,43 @@ namespace PGPEncrypt
             if (a.Count >= 1 && a[0] == "-combine")
             {
                 AttachCliConsole();
+                // -combine <輸出檔> -pk <公鑰檔|-> [xz|zstd|store] <項目...>（純 C# 加密）
+                if (a.Count >= 3 && a[2] == "-pk")
+                {
+                    if (a.Count < 5) { Console.WriteLine(Usage()); return 2; }
+                    PgpPublicKey pkKey;
+                    try { pkKey = LoadPkKey(a[3]); }
+                    catch (Exception ex) { ConsoleLog("公鑰解析失敗：" + ex.Message, 2); return 2; }
+                    ConsoleLog("公鑰：" + pkKey.Describe(), 1);
+                    string pkMode = "xz";
+                    int pkIdx = 4;
+                    string pm = a[pkIdx].ToLowerInvariant();
+                    if (pm == "tar" || pm == "none") pm = "store";
+                    if (CompSuffix.ContainsKey(pm))
+                    {
+                        pkMode = pm;
+                        pkIdx = 5;
+                        if (pkMode == "zstd" && !ZstdOk)
+                        {
+                            Console.WriteLine("本機 tar.exe 的 zstd 串流寫出後無法讀回（bsdtar 已知問題），請使用 xz 或 store（僅打包）。");
+                            return 2;
+                        }
+                    }
+                    if (a.Count - pkIdx < 1) { Console.WriteLine("至少需要一個要合併的項目。"); return 2; }
+                    string[] pkItems = a.GetRange(pkIdx, a.Count - pkIdx).ToArray();
+                    string pkOutp = GetCombinedOutputPath(a[1], pkMode);
+                    try
+                    {
+                        PkCombinedCompressEncrypt(pkItems, pkKey, pkOutp, pkMode, ConsoleLog, MakeCliProgress());
+                        ConsoleLog("完成：" + pkOutp, 1);
+                        return 0;
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleLog("失敗：" + ex.Message, 2);
+                        return 1;
+                    }
+                }
                 if (GpgExe.Length == 0) { Console.WriteLine("找不到 gpg.exe，請先安裝 GnuPG（Gpg4win）。"); return 2; }
                 if (a.Count < 3) { Console.WriteLine(Usage()); return 2; }
                 string mode = "xz";
@@ -159,6 +197,49 @@ namespace PGPEncrypt
                 }
             }
 
+            // -pk <公鑰檔|-> [xz|zstd|store] <項目...>
+            // 純 C# 加密：解析 ASCII-armored 公鑰後由內建模組加密，不呼叫 gpg、不簽署。
+            if (a.Count >= 1 && a[0] == "-pk")
+            {
+                AttachCliConsole();
+                if (a.Count < 3) { Console.WriteLine(Usage()); return 2; }
+                PgpPublicKey pkKey;
+                try { pkKey = LoadPkKey(a[1]); }
+                catch (Exception ex) { ConsoleLog("公鑰解析失敗：" + ex.Message, 2); return 2; }
+                ConsoleLog("公鑰：" + pkKey.Describe(), 1);
+                string mode = "xz";
+                int idx = 2;
+                string pm = a[idx].ToLowerInvariant();
+                if (pm == "tar" || pm == "none") pm = "store";
+                if (CompSuffix.ContainsKey(pm))
+                {
+                    mode = pm;
+                    idx = 3;
+                    if (mode == "zstd" && !ZstdOk)
+                    {
+                        Console.WriteLine("本機 tar.exe 的 zstd 串流寫出後無法讀回（bsdtar 已知問題），請使用 xz 或 store（僅打包）。");
+                        return 2;
+                    }
+                }
+                if (a.Count - idx < 1) { Console.WriteLine("至少需要一個要加密的項目。"); return 2; }
+                string[] items = a.GetRange(idx, a.Count - idx).ToArray();
+                try
+                {
+                    foreach (string item in items)
+                    {
+                        string outp = GetOutputPath(item, mode);
+                        PkEncryptInput(item, pkKey, outp, mode, ConsoleLog, MakeCliProgress());
+                        ConsoleLog("完成：" + outp, 1);
+                    }
+                    return 0;
+                }
+                catch (Exception ex)
+                {
+                    ConsoleLog("失敗：" + ex.Message, 2);
+                    return 1;
+                }
+            }
+
             // CLI：<路徑> <收件人> [xz|zstd|store]
             // 收件人判定：第二個參數不是既有路徑，且含 @ 或為十六進位 KeyID
             bool looksCli = false;
@@ -214,6 +295,8 @@ namespace PGPEncrypt
             return "用法：PGPEncrypt.exe <資料夾或檔案> <收件人KeyID或Email> [xz|zstd|store]\r\n" +
                    "      PGPEncrypt.exe -combine <輸出檔> <收件人> [xz|zstd|store] <項目...>\r\n" +
                    "      PGPEncrypt.exe -pw [-len 位數] [-mx 等級] [-toname] [-out <輸出檔>] <項目...>\r\n" +
+                   "      PGPEncrypt.exe -pk <公鑰檔|-> [xz|zstd|store] <項目...>\r\n" +
+                   "      PGPEncrypt.exe -combine <輸出檔> -pk <公鑰檔|-> [xz|zstd|store] <項目...>\r\n" +
                    "      （不帶參數或拖放檔案時開啟圖形介面）";
         }
 
@@ -788,6 +871,208 @@ namespace PGPEncrypt
                 throw new ApplicationException("來源不是有效資料夾或檔案：" + sourcePath);
         }
 
+        // ---------- 純 C# 加密模式（-pk ／ GUI 公鑰明文） ----------
+
+        // 由輸出檔名推導封裝內的名稱（去掉 .gpg），僅供 literal packet 使用
+        private static string LiteralNameFromOutput(string outputFile)
+        {
+            string n = Path.GetFileName(outputFile ?? "");
+            if (n.EndsWith(".gpg", StringComparison.OrdinalIgnoreCase)) n = n.Substring(0, n.Length - 4);
+            if (n.Length == 0) n = "archive";
+            return n;
+        }
+
+        // 讀入 ASCII-armored 公鑰（檔案路徑，或 -pk - 表示從標準輸入貼入）
+        internal static PgpPublicKey LoadPkKey(string path)
+        {
+            string text;
+            if (path == "-")
+            {
+                text = Console.In.ReadToEnd();
+            }
+            else if (File.Exists(path))
+            {
+                text = File.ReadAllText(path, Encoding.UTF8);
+            }
+            else
+            {
+                throw new ApplicationException("找不到公鑰檔：" + path + "（或用 -pk - 從標準輸入貼入）");
+            }
+            if (text.IndexOf("BEGIN PGP PUBLIC KEY BLOCK", StringComparison.Ordinal) < 0)
+                throw new ApplicationException("這不是 ASCII-armored 公鑰文字。請用 gpg --armor --export <KeyID> 取得。");
+            return PurePgp.ParseEncryptionKey(PurePgp.ArmorDecode(text));
+        }
+
+        // tar 串流（經暫存批次檔 + 哨兵檔取得結束碼）→ 本程式讀取原始位元組即時加密，
+        // 明文不落地；不使用 .NET 重新導向給 gpg（避免 BOM 問題），此處是直接二進位讀取。
+        internal static void PkTarEncrypt(string tarArguments, string outputFile, PgpPublicKey key, string literalName, ProgressTracker progress)
+        {
+            string ecFile = Path.GetTempFileName();
+            string tarErr = Path.GetTempFileName();
+            string leftCmd = Path.GetTempFileName();
+            File.Delete(leftCmd);
+            leftCmd += ".cmd";
+            StringBuilder b = new StringBuilder();
+            b.AppendLine("@echo off");
+            b.AppendLine(Q(TarExe) + " %PGPTAR% 2> " + Q(tarErr));
+            b.AppendLine("> " + Q(ecFile) + " echo %errorlevel%");
+            File.WriteAllText(leftCmd, b.ToString(), Encoding.ASCII);
+
+            if (progress != null)
+            {
+                progress.TarErrFile = tarErr;
+                progress.OutputFile = outputFile;
+                progress.Start();
+            }
+
+            ProcessStartInfo psi = new ProcessStartInfo(
+                Environment.GetEnvironmentVariable("ComSpec") ?? "cmd.exe",
+                "/d /s /c " + Q(leftCmd));
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;          // tar 的原始位元組串流（cmd 不轉碼）
+            psi.RedirectStandardError = false;
+            psi.EnvironmentVariables["PGPTAR"] = tarArguments;
+
+            FileStream outp = new FileStream(outputFile, FileMode.Create, FileAccess.Write, FileShare.None);
+            try
+            {
+                using (Process p = Process.Start(psi))
+                using (OpenPgpLiteralEncryptor enc = new OpenPgpLiteralEncryptor(outp, key, literalName))
+                {
+                    Stream src = p.StandardOutput.BaseStream;
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = src.Read(buf, 0, buf.Length)) > 0) enc.Write(buf, 0, n);
+                    p.WaitForExit();
+                    enc.Finish();
+                    outp.Flush();
+                }
+            }
+            catch
+            {
+                try { outp.Close(); } catch { }
+                TryDelete(outputFile);
+                throw;
+            }
+            if (progress != null) progress.Stop();
+
+            int tarExit = 1;
+            try { tarExit = int.Parse(File.ReadAllText(ecFile).Trim()); } catch { }
+            string tarMsg = "";
+            try { tarMsg = File.ReadAllText(tarErr); } catch { }
+            if (tarMsg.Length > 2000) tarMsg = tarMsg.Substring(tarMsg.Length - 2000);
+            TryDelete(leftCmd);
+            TryDelete(ecFile);
+            TryDelete(tarErr);
+            if (tarExit != 0)
+            {
+                TryDelete(outputFile);
+                string detail = tarMsg.Trim().Length > 0 ? "：" + tarMsg.Trim() : "";
+                throw new ApplicationException("tar 壓縮失敗（結束碼 " + tarExit + "）" + detail);
+            }
+        }
+
+        // 單一檔案直接加密（不經 tar）
+        internal static void PkFileEncrypt(string sourcePath, PgpPublicKey key, string outputFile, Action<string, int> log, Action<int> onProgress)
+        {
+            string full = NormalizePath(sourcePath);
+            if (!File.Exists(full))
+                throw new ApplicationException("來源不是有效檔案：" + full);
+            log("加密檔案中（內建模組）：" + Path.GetFileName(full), 0);
+            ProgressTracker pt = null;
+            if (onProgress != null)
+            {
+                pt = new ProgressTracker();
+                pt.OutputFile = outputFile;
+                try { pt.TotalBytes = new FileInfo(full).Length; } catch { pt.TotalBytes = 0; }
+                pt.OnProgress = onProgress;
+                pt.Start();
+            }
+            FileStream outp = new FileStream(outputFile, FileMode.Create, FileAccess.Write, FileShare.None);
+            try
+            {
+                using (FileStream fs = File.OpenRead(full))
+                using (OpenPgpLiteralEncryptor enc = new OpenPgpLiteralEncryptor(outp, key, Path.GetFileName(full)))
+                {
+                    byte[] buf = new byte[65536];
+                    int n;
+                    while ((n = fs.Read(buf, 0, buf.Length)) > 0) enc.Write(buf, 0, n);
+                    enc.Finish();
+                    outp.Flush();
+                }
+            }
+            catch
+            {
+                try { outp.Close(); } catch { }
+                TryDelete(outputFile);
+                throw;
+            }
+            if (pt != null) pt.Stop();
+        }
+
+        // 單一資料夾：tar 打包後以內建模組加密
+        internal static void PkCompressEncrypt(string sourcePath, PgpPublicKey key, string outputFile, string mode, Action<string, int> log, Action<int> onProgress)
+        {
+            string full = NormalizePath(sourcePath);
+            if (Regex.IsMatch(full, "^[A-Za-z]:\\\\?$"))
+                throw new ApplicationException("無法加密磁碟根目錄，請選擇其下的子資料夾。");
+            if (!Directory.Exists(full))
+                throw new ApplicationException("來源不是有效資料夾：" + full);
+            string parent = Path.GetDirectoryName(full);
+            string name = Path.GetFileName(full);
+            if (string.IsNullOrEmpty(parent))
+                throw new ApplicationException("無法取得上層資料夾：" + full);
+            log("壓縮並加密中（內建模組）：" + name, 0);
+            ProgressTracker pt = null;
+            if (onProgress != null)
+            {
+                pt = BuildTarProgress(new string[] { full });
+                pt.OnProgress = onProgress;
+            }
+            PkTarEncrypt(GetTarCompressArgs(mode, true) + " -C " + QDir(parent) + " " + Q(name),
+                         outputFile, key, LiteralNameFromOutput(outputFile), pt);
+        }
+
+        internal static void PkEncryptInput(string sourcePath, PgpPublicKey key, string outputFile, string mode, Action<string, int> log, Action<int> onProgress)
+        {
+            if (Directory.Exists(sourcePath))
+                PkCompressEncrypt(sourcePath, key, outputFile, mode, log, onProgress);
+            else if (File.Exists(sourcePath))
+                PkFileEncrypt(sourcePath, key, outputFile, log, onProgress);
+            else
+                throw new ApplicationException("來源不是有效資料夾或檔案：" + sourcePath);
+        }
+
+        internal static void PkCombinedCompressEncrypt(string[] sourcePaths, PgpPublicKey key, string outputFile, string mode, Action<string, int> log, Action<int> onProgress)
+        {
+            List<string> tarParts = new List<string>();
+            tarParts.Add(GetTarCompressArgs(mode, true));
+            List<string> entryNames = new List<string>();
+            foreach (string source in sourcePaths)
+            {
+                string full = NormalizePath(source);
+                if (Regex.IsMatch(full, "^[A-Za-z]:\\\\?$"))
+                    throw new ApplicationException("無法合併磁碟根目錄，請選擇其下的資料夾或檔案。");
+                if (!Directory.Exists(full) && !File.Exists(full))
+                    throw new ApplicationException("來源不是有效資料夾或檔案：" + full);
+                string parent = Path.GetDirectoryName(full);
+                string name = Path.GetFileName(full);
+                if (entryNames.Contains(name))
+                    throw new ApplicationException("合併項目有重複名稱：" + name + "。請重新命名後再合併。");
+                entryNames.Add(name);
+                tarParts.Add("-C " + QDir(parent) + " " + Q(name));
+            }
+            log("合併 " + sourcePaths.Length + " 個項目並加密中（內建模組）…", 0);
+            ProgressTracker pt = null;
+            if (onProgress != null)
+            {
+                pt = BuildTarProgress(sourcePaths);
+                pt.OnProgress = onProgress;
+            }
+            PkTarEncrypt(string.Join(" ", tarParts.ToArray()), outputFile, key, LiteralNameFromOutput(outputFile), pt);
+        }
+
         // ---------- 密碼模式（7z AES-256） ----------
 
         internal const string PasswordChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -963,6 +1248,831 @@ namespace PGPEncrypt
         }
     }
 
+    // ============================================================
+    // 純 C# OpenPGP 加密（GUI「公鑰明文」模式／命令列 -pk）
+    // ------------------------------------------------------------
+    // 不呼叫 gpg.exe：自行解析 ASCII-armored 公鑰、取出可加密子鑰，
+    // 以 X25519 ECDH（RFC 6637）或 RSA PKCS#1 v1.5 包好會話密鑰，
+    // 再以 OpenPGP CFB + MDC 組成標準 SEIPD 訊息。
+    // 輸出為一般 .gpg 檔，收件人以 gpg -d 解密（與 gpg 模式相同）；
+    // 本模式只加密、不簽署（私鑰留給 GnuPG，簽署請用 gpg 模式）。
+    // ============================================================
+    internal class PgpPublicKey
+    {
+        public long KeyId;
+        public byte[] Fingerprint = new byte[20];
+        public string Uid = "";
+        public int Algo;                     // 1/2/3=RSA、18=ECDH
+        public DateTime CreatedUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        public DateTime ExpireUtc = DateTime.MaxValue;
+        public int KeyFlags;
+        public byte[] RsaN;                  // RSA 模數（大端）
+        public byte[] RsaE;                  // RSA 公開指數
+        public byte[] EcPoint;               // ECDH 點（0x40 || X，33 bytes）
+        public byte[] CurveOid;              // ECDH 曲線 OID（DER）
+        public int KdfHashAlgo = 8;          // ECDH KDF 雜湊（8=SHA256、9=SHA384、10=SHA512）
+        public int KdfSymAlgo = 9;           // ECDH KDF 對稱演算法（7=AES128、8=AES192、9=AES256）
+
+        public bool IsEncryptCapableAlgo()
+        {
+            if (Algo == 1 || Algo == 2 || Algo == 3) return RsaN != null && RsaE != null;
+            if (Algo == 18) return EcPoint != null && CurveOid != null;
+            return false;
+        }
+
+        public bool CanEncrypt()
+        {
+            // RFC 4880bis 金鑰旗標：0x04 加密通訊、0x08 加密儲存
+            if (!IsEncryptCapableAlgo()) return false;
+            if (KeyFlags == 0) return true;             // 未標旗標時視為可用
+            return (KeyFlags & 0x0C) != 0;
+        }
+
+        public bool Expired()
+        {
+            return ExpireUtc < DateTime.UtcNow;
+        }
+
+        public string AlgoName()
+        {
+            if (Algo == 18) return "ECDH";
+            if (Algo == 1 || Algo == 2 || Algo == 3) return "RSA";
+            return "?" + Algo;
+        }
+
+        public string Describe()
+        {
+            return Uid + "  [" + KeyId.ToString("X") + "]（" + AlgoName() + "）";
+        }
+    }
+
+    internal static class PurePgp
+    {
+        // Curve25519 = 1.3.6.1.4.1.3029.1.5.1
+        private static readonly byte[] Curve25519OidDer =
+            new byte[] { 0x2B, 0x06, 0x01, 0x04, 0x01, 0x97, 0x55, 0x01, 0x05, 0x01 };
+
+        private static readonly RNGCryptoServiceProvider Rng = new RNGCryptoServiceProvider();
+        private static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        internal static byte[] RandomBytes(int n)
+        {
+            byte[] b = new byte[n];
+            lock (Rng) { Rng.GetBytes(b); }
+            return b;
+        }
+
+        private static uint Be32(byte[] b, int off)
+        {
+            return ((uint)b[off] << 24) | ((uint)b[off + 1] << 16) | ((uint)b[off + 2] << 8) | b[off + 3];
+        }
+
+        // 小端位元組 → BigInteger（RFC 7748 的編碼方式）。
+        // 注意：BigInteger(byte[]) 本身就是小端二補數，只需補一個 0 位元組確保非負。
+        internal static BigInteger FromLe(byte[] b)
+        {
+            byte[] r = new byte[b.Length + 1];
+            Array.Copy(b, 0, r, 0, b.Length);
+            return new BigInteger(r);
+        }
+
+        // ---------- X25519（RFC 7748） ----------
+        // ---------- X25519（RFC 7748） ----------
+        internal static byte[] X25519(byte[] scalar, byte[] u)
+        {
+            if (scalar == null || scalar.Length != 32) throw new ApplicationException("X25519 私鑰長度不正確。");
+            if (u == null || u.Length != 32) throw new ApplicationException("X25519 座標長度不正確。");
+            BigInteger p = (BigInteger.One << 255) - 19;
+            byte[] uc = (byte[])u.Clone();
+            uc[31] = (byte)(uc[31] & 0x7F);                          // 遮蔽最高位元（RFC 7748）
+            BigInteger x1 = FromLe(uc);                                 // u 座標（小端）
+            byte[] k = (byte[])scalar.Clone();
+            k[0] = (byte)(k[0] & 248); k[31] = (byte)((k[31] & 127) | 64);
+            BigInteger kk = FromLe(k);
+            BigInteger a24 = 121665;                                  // (486662 - 2) / 4
+            BigInteger x2 = BigInteger.One, z2 = BigInteger.Zero;
+            BigInteger x3 = x1, z3 = BigInteger.One;
+            int swap = 0;
+            for (int t = 254; t >= 0; t--)
+            {
+                int kt = (int)((kk >> t) & BigInteger.One);
+                swap ^= kt;
+                if (swap != 0) { BigInteger tmp = x2; x2 = x3; x3 = tmp; tmp = z2; z2 = z3; z3 = tmp; }
+                swap = kt;
+                BigInteger A = (x2 + z2) % p;
+                BigInteger AA = (A * A) % p;
+                BigInteger B = (x2 - z2 + p) % p;
+                BigInteger BB = (B * B) % p;
+                BigInteger E = (AA - BB + p) % p;
+                BigInteger C = (x3 + z3) % p;
+                BigInteger D = (x3 - z3 + p) % p;
+                BigInteger DA = (D * A) % p;
+                BigInteger CB = (C * B) % p;
+                BigInteger sum = (DA + CB) % p;
+                BigInteger dif = (DA - CB + p) % p;
+                x3 = (sum * sum) % p;
+                z3 = (x1 * ((dif * dif) % p)) % p;
+                x2 = (AA * BB) % p;
+                z2 = (E * (AA + (a24 * E) % p)) % p;
+            }
+            if (swap != 0) { BigInteger tmp = x2; x2 = x3; x3 = tmp; tmp = z2; z2 = z3; z3 = tmp; }
+            BigInteger res = (x2 * ModInverse(z2, p)) % p;
+            byte[] le = res.ToByteArray();                                    // 小端、含正負號位元組
+            byte[] o = new byte[32];
+            for (int i = 0; i < 32 && i < le.Length; i++) o[i] = le[i];
+            return o;
+        }
+
+        private static BigInteger ModInverse(BigInteger a, BigInteger p)
+        {
+            if (a.Sign < 0) a += p;
+            return BigInteger.ModPow(a, p - 2, p);
+        }
+
+        // ---------- armor 解碼 ----------
+        internal static byte[] ArmorDecode(string text)
+        {
+            if (string.IsNullOrEmpty(text))
+                throw new ApplicationException("公鑰內容為空。");
+            const string begin = "-----BEGIN PGP PUBLIC KEY BLOCK-----";
+            const string end = "-----END PGP PUBLIC KEY BLOCK-----";
+            int bi = text.IndexOf(begin, StringComparison.Ordinal);
+            if (bi < 0) throw new ApplicationException("找不到公鑰開頭標記（-----BEGIN PGP PUBLIC KEY BLOCK-----）。請貼入完整的公鑰文字。");
+            bi += begin.Length;
+            int ei = text.IndexOf(end, bi, StringComparison.Ordinal);
+            if (ei < 0) throw new ApplicationException("找不到公鑰結尾標記（-----END PGP PUBLIC KEY BLOCK-----）。請貼入完整的公鑰文字。");
+            string[] lines = text.Substring(bi, ei - bi).Split('\n');
+            bool body = false;
+            StringBuilder b64 = new StringBuilder();
+            string crc = null;
+            foreach (string ln0 in lines)
+            {
+                string ln = ln0.TrimEnd('\r');
+                if (!body)
+                {
+                    if (ln.Length == 0) { body = true; continue; }
+                    if (ln.IndexOf(':') >= 0) continue;                    // armor 標頭（Version / Comment…）
+                    body = true;
+                }
+                if (ln.Length == 0) continue;
+                if (ln[0] == '=') { crc = ln.Substring(1).Trim(); continue; }  // CRC24（=XXXX）
+                b64.Append(ln.Trim());
+            }
+            byte[] raw;
+            try { raw = Convert.FromBase64String(b64.ToString()); }
+            catch { throw new ApplicationException("公鑰的 base64 內容無效（貼上時可能漏行或漏字元）。"); }
+            if (raw.Length == 0) throw new ApplicationException("公鑰內容解碼後為空。");
+            if (crc != null && !VerifyCrc24(raw, crc))
+                throw new ApplicationException("公鑰 CRC24 校驗失敗（貼上時可能漏行或漏字元）。");
+            return raw;
+        }
+
+        private static uint Crc24(byte[] data)
+        {
+            uint crc = 0xB704CE;
+            foreach (byte b in data)
+            {
+                crc ^= (uint)b << 16;
+                for (int i = 0; i < 8; i++)
+                {
+                    crc <<= 1;
+                    if ((crc & 0x1000000) != 0) crc ^= 0x1864CFB;
+                }
+            }
+            return crc & 0xFFFFFF;
+        }
+
+        private static bool VerifyCrc24(byte[] data, string crcB64)
+        {
+            // armor 的 =XXXX 是 4 個 base64 字元（=3 bytes），不可再補 padding
+            byte[] want;
+            string s = (crcB64 ?? "").Trim();
+            try { want = Convert.FromBase64String(s); }
+            catch
+            {
+                try { want = Convert.FromBase64String(s + "=="); }
+                catch { return false; }
+            }
+            if (want.Length < 3) return false;
+            uint expect = ((uint)want[0] << 16) | ((uint)want[1] << 8) | want[2];
+            return Crc24(data) == expect;
+        }
+
+        // ---------- 封包解析 ----------
+        private struct PgpPacket { public int Tag; public byte[] Body; }
+
+        private static List<PgpPacket> ReadPackets(byte[] data)
+        {
+            List<PgpPacket> list = new List<PgpPacket>();
+            int pos = 0;
+            while (pos < data.Length)
+            {
+                int b = data[pos++];
+                if ((b & 0x80) == 0)
+                    throw new ApplicationException("公鑰資料不是有效的 OpenPGP 封包串流。");
+                int tag;
+                long bodyLen;
+                if ((b & 0x40) != 0)
+                {
+                    tag = b & 0x3F;
+                    if (pos >= data.Length) throw new ApplicationException("公鑰封包長度欄位不完整。");
+                    int o = data[pos++];
+                    if (o < 192) bodyLen = o;
+                    else if (o < 224) { bodyLen = (long)((o - 192) << 8) + data[pos++] + 192; }
+                    else if (o == 255)
+                    {
+                        bodyLen = ((long)data[pos] << 24) | ((long)data[pos + 1] << 16) | ((long)data[pos + 2] << 8) | data[pos + 3];
+                        pos += 4;
+                    }
+                    else throw new ApplicationException("公鑰封包使用分段長度，無法解析。");
+                }
+                else
+                {
+                    tag = (b >> 2) & 0x0F;
+                    int lt = b & 3;
+                    if (lt == 0) bodyLen = data[pos++];
+                    else if (lt == 1) { bodyLen = ((long)data[pos] << 8) | data[pos + 1]; pos += 2; }
+                    else if (lt == 2)
+                    {
+                        bodyLen = ((long)data[pos] << 24) | ((long)data[pos + 1] << 16) | ((long)data[pos + 2] << 8) | data[pos + 3];
+                        pos += 4;
+                    }
+                    else bodyLen = data.Length - pos;
+                }
+                if (bodyLen < 0 || pos + bodyLen > data.Length)
+                    throw new ApplicationException("公鑰封包長度超過資料範圍。");
+                byte[] body = new byte[bodyLen];
+                Array.Copy(data, pos, body, 0, (int)bodyLen);
+                pos += (int)bodyLen;
+                list.Add(new PgpPacket { Tag = tag, Body = body });
+            }
+            return list;
+        }
+
+        private static bool ReadMpi(byte[] b, int pos, out byte[] value)
+        {
+            value = null;
+            if (pos + 2 > b.Length) return false;
+            int bits = (b[pos] << 8) | b[pos + 1];
+            pos += 2;
+            if (bits == 0) { value = new byte[0]; return true; }
+            int n = (bits + 7) / 8;
+            if (n > 0x8000 || pos + n > b.Length) return false;
+            value = new byte[n];
+            Array.Copy(b, pos, value, 0, n);
+            return true;
+        }
+
+        private static bool ReadMpi(byte[] b, ref int pos, out byte[] value)
+        {
+            int p = pos;
+            bool ok = ReadMpi(b, p, out value);
+            if (ok)
+            {
+                if (value.Length == 0) pos = p + 2;
+                else pos = p + 2 + value.Length;
+            }
+            return ok;
+        }
+
+        private static PgpPublicKey KeyFromBody(byte[] body)
+        {
+            if (body.Length < 6) return null;
+            if (body[0] != 4) return null;                       // 僅支援 v4
+            PgpPublicKey k = new PgpPublicKey();
+            k.CreatedUtc = UnixEpoch.AddSeconds(Be32(body, 1));
+            k.Algo = body[5];
+            int pos = 6;
+            if (k.Algo == 1 || k.Algo == 2 || k.Algo == 3)
+            {
+                byte[] n, e;
+                if (!ReadMpi(body, ref pos, out n) || !ReadMpi(body, ref pos, out e)) return null;
+                k.RsaN = n; k.RsaE = e;
+            }
+            else if (k.Algo == 18)
+            {
+                // RFC 6637 §9：曲線 OID 是「1-byte 長度 + OID」（不是 MPI），其後的 EC 點才是 MPI
+                if (pos + 1 > body.Length) return null;
+                int oidLen = body[pos];
+                pos += 1;
+                if (oidLen == 0 || pos + oidLen > body.Length) return null;
+                k.CurveOid = new byte[oidLen];
+                Array.Copy(body, pos, k.CurveOid, 0, oidLen);
+                pos += oidLen;
+                byte[] point;
+                if (!ReadMpi(body, ref pos, out point)) return null;
+                if (point.Length != 33 || point[0] != 0x40) return null;
+                k.EcPoint = point;
+                if (pos < body.Length)
+                {
+                    int l = body[pos];
+                    if (l >= 3 && pos + l < body.Length)
+                    {
+                        int b0 = pos + 1;
+                        k.KdfHashAlgo = body[b0 + 1];
+                        k.KdfSymAlgo = body[b0 + 2];
+                    }
+                }
+            }
+            else
+            {
+                return null;                                     // EdDSA／DSA／Elgamal 等非加密用途
+            }
+            using (SHA1 sha = SHA1.Create())
+            {
+                byte[] pre = new byte[3 + body.Length];
+                pre[0] = 0x99;
+                pre[1] = (byte)(body.Length >> 8);
+                pre[2] = (byte)(body.Length & 0xFF);
+                Array.Copy(body, 0, pre, 3, body.Length);
+                k.Fingerprint = sha.ComputeHash(pre);
+            }
+            k.KeyId = 0;
+            for (int i = 12; i < 20; i++) k.KeyId = (k.KeyId << 8) | k.Fingerprint[i];
+            return k;
+        }
+
+        // 取出 v4 簽章的類型、金鑰旗標（subpacket 27）與過期秒數（subpacket 9）
+        private static void ParseSigV4(byte[] s, out int sigType, out int keyFlags, out uint expireSec)
+        {
+            sigType = 0; keyFlags = 0; expireSec = 0;
+            if (s == null || s.Length < 6 || s[0] != 4) return;
+            sigType = s[1];
+            int pos = 4;
+            if (pos + 2 > s.Length) return;
+            int hlen = (s[pos] << 8) | s[pos + 1];
+            pos += 2;
+            int end = Math.Min(pos + hlen, s.Length);
+            while (pos < end)
+            {
+                int o = s[pos++];
+                int slen;
+                if (o < 192) slen = o;
+                else if (o < 255) slen = ((o - 192) << 8) + s[pos++] + 192;
+                else
+                {
+                    if (pos + 4 > s.Length) return;
+                    slen = (int)Be32(s, pos);
+                    pos += 4;
+                }
+                if (slen < 1 || pos + slen > s.Length) return;
+                int type = s[pos];
+                // subpacket 內容是否關鍵不影響旗標判讀
+                if (type == 27 && slen >= 2) keyFlags = s[pos + 1];
+                else if (type == 9 && slen >= 5) expireSec = Be32(s, pos + 1);
+                pos += slen;
+            }
+        }
+
+        internal static PgpPublicKey ParseEncryptionKey(byte[] keyData)
+        {
+            List<PgpPacket> pkts = ReadPackets(keyData);
+            PgpPublicKey primary = null;
+            PgpPublicKey lastSub = null;
+            string uid = "";
+            List<PgpPublicKey> subs = new List<PgpPublicKey>();
+            PgpPublicKey flagged = null;
+            foreach (PgpPacket p in pkts)
+            {
+                if (p.Tag == 6)
+                {
+                    primary = KeyFromBody(p.Body);
+                }
+                else if (p.Tag == 13)
+                {
+                    byte[] u = p.Body;
+                    int len = u.Length;
+                    while (len > 0 && u[len - 1] == 0) len--;
+                    uid = Encoding.UTF8.GetString(u, 0, len);
+                    if (primary != null) primary.Uid = uid;
+                }
+                else if (p.Tag == 14)
+                {
+                    lastSub = KeyFromBody(p.Body);
+                    if (lastSub != null) { lastSub.Uid = uid; subs.Add(lastSub); }
+                }
+                else if (p.Tag == 2)
+                {
+                    int sigType, flags; uint expire;
+                    ParseSigV4(p.Body, out sigType, out flags, out expire);
+                    PgpPublicKey target = null;
+                    if (sigType == 0x18) target = lastSub;
+                    else if (sigType == 0x13) target = primary;
+                    if (target != null)
+                    {
+                        target.KeyFlags = flags;
+                        if (expire > 0) target.ExpireUtc = target.CreatedUtc.AddSeconds(expire);
+                        if (flagged == null && target.CanEncrypt() && !target.Expired())
+                            flagged = target;
+                    }
+                }
+            }
+            if (flagged != null) return flagged;
+            // 沒有旗標資訊：退而求其次，挑最新的可用子鑰
+            PgpPublicKey newest = null;
+            foreach (PgpPublicKey s in subs)
+            {
+                if (!s.IsEncryptCapableAlgo() || s.Expired()) continue;
+                if (s.Algo == 18 && !OidIsCurve25519(s.CurveOid)) continue;
+                if (newest == null || s.CreatedUtc > newest.CreatedUtc) newest = s;
+            }
+            if (newest != null) return newest;
+            if (primary != null && primary.CanEncrypt() && !primary.Expired()
+                && (primary.Algo != 18 || OidIsCurve25519(primary.CurveOid)))
+                return primary;
+            throw new ApplicationException("這把公鑰沒有可用的加密子鑰（需要 ECDH Curve25519 或 RSA 金鑰）。");
+        }
+
+        private static bool OidIsCurve25519(byte[] oid)
+        {
+            if (oid == null || oid.Length != Curve25519OidDer.Length) return false;
+            for (int i = 0; i < oid.Length; i++) if (oid[i] != Curve25519OidDer[i]) return false;
+            return true;
+        }
+
+        // ---------- ECDH KDF（RFC 6637 §8） ----------
+        // hashAlgo 與 kekAlgo 各自獨立：前者決定 KDF 雜湊（公鑰的 KDF hash ID），
+        // 後者決定 KEK 長度（公鑰的 KEK alg ID），兩者不可互相推導。
+        private static byte[] EcdhKdf(byte[] z, byte[] oid, byte[] fp, int hashAlgo, int kekAlgo, out int keyLen)
+        {
+            MemoryStream m = new MemoryStream();
+            m.WriteByte(0); m.WriteByte(0); m.WriteByte(0); m.WriteByte(1);
+            m.Write(z, 0, z.Length);
+            // RFC 6637 §8：Param = curve_OID_len || curve_OID || alg_ID(18) ||
+            // 03 || 01 || KDF_hash_ID || KEK_alg_ID || "Anonymous Sender    " || fingerprint
+            m.WriteByte((byte)oid.Length);
+            m.Write(oid, 0, oid.Length);
+            m.WriteByte(18);
+            m.WriteByte(3);                                      // 後續 KDF 參數長度
+            m.WriteByte(1);                                      // 保留
+            m.WriteByte((byte)hashAlgo);
+            m.WriteByte((byte)kekAlgo);
+            // RFC 6637 §8／RFC 4880 §12.1：此標籤固定 20 octets（"Anonymous Sender" 右側補空白）
+            m.Write(Encoding.ASCII.GetBytes("Anonymous Sender    "), 0, 20);
+            m.Write(fp, 0, fp.Length);
+            byte[] stream = m.ToArray();
+            byte[] x;
+            if (hashAlgo == 8) { using (SHA256 h = SHA256.Create()) x = h.ComputeHash(stream); }
+            else if (hashAlgo == 9) { using (SHA384 h = SHA384.Create()) x = h.ComputeHash(stream); }
+            else if (hashAlgo == 10) { using (SHA512 h = SHA512.Create()) x = h.ComputeHash(stream); }
+            else throw new ApplicationException("不支援的 KDF 雜湊演算法（需要 SHA256/384/512）。");
+            // KEK 長度由 KEK_alg_ID 決定（RFC 4880 §13.5）：7=AES128、8=AES192、9=AES256
+            if (kekAlgo == 7) keyLen = 16;
+            else if (kekAlgo == 8) keyLen = 24;
+            else if (kekAlgo == 9) keyLen = 32;
+            else throw new ApplicationException("不支援的 KEK 演算法（需要 AES-128/192/256）。");
+            if (keyLen > x.Length) throw new ApplicationException("KDF 輸出長度不足。");
+            byte[] kek = new byte[keyLen];
+            Array.Copy(x, 0, kek, 0, keyLen);
+            return kek;
+        }
+
+        // ---------- AES Key Wrap（RFC 3394） ----------
+        private static byte[] AesKeyWrap(byte[] kek, byte[] input)
+        {
+            if (input.Length % 8 != 0 || input.Length < 16)
+                throw new ApplicationException("AES key wrap 輸入長度不正確。");
+            int n = input.Length / 8;
+            byte[] a = new byte[] { 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6, 0xA6 };
+            byte[] r = new byte[input.Length];
+            Array.Copy(input, r, input.Length);
+            byte[] block = new byte[16];
+            byte[] outb = new byte[16];
+            using (AesManaged aes = new AesManaged())
+            {
+                aes.Mode = CipherMode.ECB;
+                aes.Padding = PaddingMode.None;
+                aes.Key = kek;
+                ICryptoTransform enc = aes.CreateEncryptor();
+                for (int j = 0; j <= 5; j++)
+                    for (int i = 1; i <= n; i++)
+                    {
+                        Array.Copy(a, 0, block, 0, 8);
+                        Array.Copy(r, (i - 1) * 8, block, 8, 8);
+                        enc.TransformBlock(block, 0, 16, outb, 0);
+                        Array.Copy(outb, 0, a, 0, 8);
+                        ulong t = (ulong)(j * n + i);
+                        for (int q = 0; q < 8; q++) a[7 - q] ^= (byte)(t >> (8 * q));
+                        Array.Copy(outb, 8, r, (i - 1) * 8, 8);
+                    }
+            }
+            byte[] res = new byte[8 + input.Length];
+            Array.Copy(a, 0, res, 0, 8);
+            Array.Copy(r, 0, res, 8, input.Length);
+            return res;
+        }
+
+        // ---------- MPI 編碼（大端；去掉前導零） ----------
+        internal static byte[] MpiEncode(byte[] bigEndian)
+        {
+            int off = 0;
+            while (off < bigEndian.Length && bigEndian[off] == 0) off++;
+            int len = bigEndian.Length - off;
+            if (len == 0) return new byte[] { 0, 0 };
+            int bits = (len - 1) * 8;
+            byte top = bigEndian[off];
+            for (int i = 7; i >= 0; i--) { if ((top & (1 << i)) != 0) { bits += i + 1; break; } }
+            byte[] o = new byte[2 + len];
+            o[0] = (byte)(bits >> 8);
+            o[1] = (byte)(bits & 0xFF);
+            Array.Copy(bigEndian, off, o, 2, len);
+            return o;
+        }
+
+        private static byte[] SessionChecksumWord(byte[] session)
+        {
+            int sum = 0;
+            foreach (byte b in session) sum = (sum + b) & 0xFFFF;
+            return new byte[] { (byte)(sum >> 8), (byte)(sum & 0xFF) };
+        }
+
+        // PKESK（tag 1）：將會話密鑰包給收件者公鑰
+        internal static byte[] BuildPkesk(PgpPublicKey key, int symAlgo, byte[] session)
+        {
+            MemoryStream body = new MemoryStream();
+            body.WriteByte(3);                                   // version 3
+            for (int i = 0; i < 8; i++)
+                body.WriteByte((byte)(key.KeyId >> (8 * (7 - i))));
+            body.WriteByte((byte)key.Algo);
+            if (key.Algo == 18)
+            {
+                byte[] ephPriv = RandomBytes(32);
+                byte[] base9 = new byte[32];
+                base9[0] = 9;
+                byte[] ephPub = X25519(ephPriv, base9);                       // 公開點
+                byte[] theirX = new byte[32];
+                Array.Copy(key.EcPoint, 1, theirX, 0, 32);
+                byte[] z = X25519(ephPriv, theirX);                          // 共享密鑰
+                int kekLen;
+                // KEK 演算法取自公鑰的 KDF 參數（非 session 的對稱演算法）；兩者通常同為 AES256，
+                // 但 gpg 預設子鑰 KDF 為 SHA256+AES128，混用會導致收件端解不開（Checksum error）。
+                byte[] kek = EcdhKdf(z, key.CurveOid, key.Fingerprint, key.KdfHashAlgo, key.KdfSymAlgo, out kekLen);
+                MemoryStream m = new MemoryStream();
+                m.WriteByte((byte)symAlgo);
+                m.Write(session, 0, session.Length);
+                byte[] cw = SessionChecksumWord(session);
+                m.Write(cw, 0, 2);
+                while (m.Length % 8 != 0) m.WriteByte(0);                     // 補零到 8 的倍數
+                byte[] wrapped = AesKeyWrap(kek, m.ToArray());
+                byte[] point = new byte[33];
+                point[0] = 0x40;
+                Array.Copy(ephPub, 0, point, 1, 32);
+                byte[] pMpi = MpiEncode(point);                                // EC 點是 MPI
+                body.Write(pMpi, 0, pMpi.Length);
+                // GnuPG parse_pubkeyenc：ECDH 的包裝密鑰是「1-octet 長度 + 資料」
+                // （simple octet string），不是 MPI
+                if (wrapped.Length < 2 || wrapped.Length > 254)
+                    throw new ApplicationException("ECDH 包裝後長度超出範圍。");
+                body.WriteByte((byte)wrapped.Length);
+                body.Write(wrapped, 0, wrapped.Length);
+            }
+            else
+            {
+                MemoryStream m = new MemoryStream();
+                m.WriteByte((byte)symAlgo);
+                m.Write(session, 0, session.Length);
+                byte[] cw = SessionChecksumWord(session);
+                m.Write(cw, 0, 2);
+                byte[] c = RsaEncryptPkcs1(key.RsaN, key.RsaE, m.ToArray());
+                byte[] cMpi = MpiEncode(c);
+                body.Write(cMpi, 0, cMpi.Length);
+            }
+            return body.ToArray();
+        }
+
+        private static byte[] RsaEncryptPkcs1(byte[] n, byte[] e, byte[] m)
+        {
+            using (RSACryptoServiceProvider rsa = new RSACryptoServiceProvider())
+            {
+                RSAParameters p = new RSAParameters();
+                p.Modulus = n;
+                p.Exponent = e;
+                rsa.ImportParameters(p);
+                return rsa.Encrypt(m, false);                    // PKCS#1 v1.5
+            }
+        }
+    }
+
+    // 串流封裝器：SEIPD（tag 18, v1）內含 literal data packet（tag 11）與 MDC（tag 19），
+    // 以 OpenPGP CFB（區塊 CFB）加密。兩層分塊（外層密文、內層明文）都遵守
+    // new-format 規則：partial 區塊必須剛好填滿，只有最後一塊用確定長度，
+    // 因此可邊讀 tar 串流邊寫出、不必知道總長度。
+    internal class OpenPgpLiteralEncryptor : IDisposable
+    {
+        private const int ChunkSize = 1 << 16;       // partial 區塊大小（2 的冪）
+        private const byte PartialHdr = 0xF0;        // 1 << (0xF0 & 0x1F) = 2^16
+
+        private readonly Stream Out;
+        private readonly string LiteralName;
+        private AesManaged Aes;
+        private ICryptoTransform Cfb;
+        private readonly byte[] Reg = new byte[16];   // CFB 移位暫存器（= 前一段密文）
+        private readonly byte[] Ks = new byte[16];    // 目前金鑰流區塊
+        private int KsPos;                            // 目前區塊已耗用位元組數（16 = 需重算）
+        private SHA1 Mdc;
+        private readonly byte[] Pb = new byte[ChunkSize];   // 明文緩衝（literal 內容）
+        private int Pn;
+        private readonly byte[] Cb = new byte[ChunkSize];   // 密文緩衝（SEIPD 內容）
+        private int Cn;
+        private bool SeipdStarted;                    // 已寫出 0xD2
+        private bool LiteralTagged;                   // 已寫出 0xCB
+        private bool Finished;
+
+        public OpenPgpLiteralEncryptor(Stream outp, PgpPublicKey key, string literalName)
+        {
+            Out = outp;
+            LiteralName = (literalName ?? "archive").Replace('\\', '/');
+            // Session 對稱演算法獨立選擇（AES256 為現代預設），與 KEK 演算法無關
+            int symAlgo = 9;  // AES256
+            byte[] session = PurePgp.RandomBytes(32);
+
+            // PKESK：一次成型，使用確定長度
+            WriteTagged(1, PurePgp.BuildPkesk(key, symAlgo, session));
+
+            Aes = new AesManaged();
+            Aes.Mode = CipherMode.ECB;
+            Aes.Padding = PaddingMode.None;
+            Aes.Key = session;
+            Cfb = Aes.CreateEncryptor();
+            Mdc = SHA1.Create();
+
+            // SEIPD 內容的第一個位元組是明文版本號 0x01（屬於第一個 partial 區塊）
+            CipherWrite(new byte[] { 0x01 }, 0, 1);
+
+            // RFC 4880 §5.7：隨機前綴 16 bytes + 重複末 2 bytes（bytes 14-15）共 18 bytes
+            byte[] rnd = PurePgp.RandomBytes(16);
+            byte[] prefix = new byte[18];
+            Array.Copy(rnd, 0, prefix, 0, 16);
+            prefix[16] = rnd[14];
+            prefix[17] = rnd[15];
+            EncFeed(prefix, 0, prefix.Length);
+
+            // literal 標頭：'b' + 檔名 + 4 位元組 mtime（位於加密流內部）
+            byte[] name = Encoding.ASCII.GetBytes(LiteralName);
+            byte[] hdr = new byte[2 + name.Length + 4];
+            hdr[0] = (byte)'b';
+            hdr[1] = (byte)name.Length;
+            Array.Copy(name, 0, hdr, 2, name.Length);
+            uint t = (uint)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
+            hdr[2 + name.Length] = (byte)(t >> 24);
+            hdr[3 + name.Length] = (byte)(t >> 16);
+            hdr[4 + name.Length] = (byte)(t >> 8);
+            hdr[5 + name.Length] = (byte)t;
+            PlainWrite(hdr, 0, hdr.Length);
+        }
+
+        public void Write(byte[] buf, int off, int len)
+        {
+            if (Finished) throw new ApplicationException("加密器已結束。");
+            PlainWrite(buf, off, len);
+        }
+
+        public void Finish()
+        {
+            if (Finished) return;
+            PlainFlushFinal();                        // literal 最後一塊（確定長度）
+            byte[] tail = new byte[] { 0xD3, 0x14 };
+            Mdc.TransformBlock(tail, 0, 2, null, 0);
+            Mdc.TransformFinalBlock(new byte[0], 0, 0);
+            byte[] mdcPkt = new byte[22];
+            mdcPkt[0] = 0xD3;
+            mdcPkt[1] = 0x14;
+            Array.Copy(Mdc.Hash, 0, mdcPkt, 2, 20);
+            EncFeedNoHash(mdcPkt, 0, 22);              // MDC 本身不再計入雜湊
+            if (KsPos > 0) { CipherWrite(Reg, 0, KsPos); KsPos = 0; }
+            SeipdFlushFinal();                        // 外層最後一塊（確定長度）
+            Out.Flush();
+            Finished = true;
+        }
+
+        // ---- 明文側：literal 封包內容分塊（partial 區塊必須剛好填滿） ----
+        private void PlainWrite(byte[] buf, int off, int len)
+        {
+            while (len > 0)
+            {
+                if (Pn == ChunkSize) PlainFlushFull();
+                int take = Math.Min(ChunkSize - Pn, len);
+                Array.Copy(buf, off, Pb, Pn, take);
+                Pn += take;
+                off += take;
+                len -= take;
+                if (Pn == ChunkSize) PlainFlushFull();
+            }
+        }
+
+        private void PlainFlushFull()
+        {
+            if (!LiteralTagged) { EncFeed(new byte[] { 0xCB }, 0, 1); LiteralTagged = true; }
+            EncFeed(new byte[] { PartialHdr }, 0, 1);
+            EncFeed(Pb, 0, Pn);
+            Pn = 0;
+        }
+
+        private void PlainFlushFinal()
+        {
+            if (!LiteralTagged) { EncFeed(new byte[] { 0xCB }, 0, 1); LiteralTagged = true; }
+            byte[] dl = DefiniteLength(Pn);
+            EncFeed(dl, 0, dl.Length);
+            EncFeed(Pb, 0, Pn);
+            Pn = 0;
+        }
+
+        // ---- 加密側：明文 → MDC 雜湊 + OpenPGP CFB ----
+        private void EncFeed(byte[] plain, int off, int len)
+        {
+            Mdc.TransformBlock(plain, off, len, null, 0);
+            EncFeedNoHash(plain, off, len);
+        }
+
+        private void EncFeedNoHash(byte[] plain, int off, int len)
+        {
+            int i = 0;
+            while (i < len)
+            {
+                if (KsPos == 0 && len - i >= 16)
+                {
+                    Cfb.TransformBlock(Reg, 0, 16, Ks, 0);
+                    for (int j = 0; j < 16; j++) Reg[j] = (byte)(plain[off + i + j] ^ Ks[j]);
+                    CipherWrite(Reg, 0, 16);
+                    i += 16;
+                }
+                else
+                {
+                    if (KsPos == 0) Cfb.TransformBlock(Reg, 0, 16, Ks, 0);
+                    Reg[KsPos] = (byte)(plain[off + i] ^ Ks[KsPos]);
+                    KsPos++;
+                    if (KsPos == 16) { KsPos = 0; CipherWrite(Reg, 0, 16); }
+                    i++;
+                }
+            }
+        }
+
+        // ---- 密文側：SEIPD 內容分塊（同樣必須剛好填滿 partial 區塊） ----
+        private void CipherWrite(byte[] buf, int off, int len)
+        {
+            while (len > 0)
+            {
+                if (Cn == ChunkSize) CipherFlushFull();
+                int take = Math.Min(ChunkSize - Cn, len);
+                Array.Copy(buf, off, Cb, Cn, take);
+                Cn += take;
+                off += take;
+                len -= take;
+                if (Cn == ChunkSize) CipherFlushFull();
+            }
+        }
+
+        private void CipherFlushFull()
+        {
+            if (!SeipdStarted) { Out.WriteByte(0xD2); SeipdStarted = true; }
+            Out.WriteByte(PartialHdr);
+            Out.Write(Cb, 0, Cn);
+            Cn = 0;
+        }
+
+        private void SeipdFlushFinal()
+        {
+            if (!SeipdStarted) { Out.WriteByte(0xD2); SeipdStarted = true; }
+            if (Cn == 0)
+            {
+                Out.WriteByte(0);                      // 空的最後一塊
+            }
+            else
+            {
+                byte[] dl = DefiniteLength(Cn);
+                Out.Write(dl, 0, dl.Length);
+                Out.Write(Cb, 0, Cn);
+                Cn = 0;
+            }
+        }
+
+        private void WriteTagged(int tag, byte[] body)
+        {
+            Out.WriteByte((byte)(0xC0 | tag));
+            byte[] dl = DefiniteLength(body.Length);
+            Out.Write(dl, 0, dl.Length);
+            Out.Write(body, 0, body.Length);
+        }
+
+        internal static byte[] DefiniteLength(long len)
+        {
+            if (len < 192) return new byte[] { (byte)len };
+            if (len < 8384)
+            {
+                long v = len - 192;
+                return new byte[] { (byte)((v >> 8) + 192), (byte)(v & 0xFF) };
+            }
+            return new byte[] { 0xFF, (byte)(len >> 24), (byte)(len >> 16), (byte)(len >> 8), (byte)len };
+        }
+
+        public void Dispose()
+        {
+            if (Cfb != null) { Cfb.Dispose(); Cfb = null; }
+            if (Aes != null) { Aes.Dispose(); Aes = null; }
+            if (Mdc != null) { Mdc.Dispose(); Mdc = null; }
+        }
+    }
+
     internal class MainForm : Form
     {
         private ListBox lstFolders;
@@ -984,6 +2094,8 @@ namespace PGPEncrypt
         private Button btnGo;
         private Label lblCount;
         private RichTextBox rtbLog;
+        private RichTextBox txtPubKey;
+        private Label lblPkStatus;
         private ProgressBar progressBar;
         private readonly List<string> inputs = new List<string>();
         private readonly Dictionary<string, string> keyMap = new Dictionary<string, string>();
@@ -994,7 +2106,7 @@ namespace PGPEncrypt
         public MainForm(List<string> prefill)
         {
             Text = "資料夾與檔案 PGP 加密與簽署工具（tar + GPG）";
-            ClientSize = new Size(694, 553);
+            ClientSize = new Size(694, 596);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -1093,6 +2205,7 @@ namespace PGPEncrypt
             Place(cboMode, 90, 236, 180, 26);
             cboMode.Items.Add("PGP 公鑰加密與簽署");
             cboMode.Items.Add("密碼加密（7z AES-256）");
+            cboMode.Items.Add("公鑰明文（內建加密）");
             cboMode.SelectedIndex = 0;
 
             lblMx = new Label();
@@ -1131,25 +2244,60 @@ namespace PGPEncrypt
             cboKey.DropDownStyle = ComboBoxStyle.DropDownList;
             Place(cboKey, 12, 292, 670, 26);
 
+            // 公鑰明文模式：貼上對方的 ASCII-armored 公鑰（內建模組加密，不呼叫 gpg）
+            txtPubKey = new RichTextBox();
+            txtPubKey.Multiline = true;
+            txtPubKey.ScrollBars = RichTextBoxScrollBars.Vertical;
+            txtPubKey.WordWrap = true;
+            txtPubKey.Font = new Font("Consolas", 8f);
+            txtPubKey.Text = "";
+            Place(txtPubKey, 12, 292, 670, 60);
+            txtPubKey.TextChanged += delegate
+            {
+                string t = txtPubKey.Text ?? "";
+                if (t.Trim().Length == 0)
+                {
+                    lblPkStatus.Text = "貼上後會自動識別金鑰";
+                    lblPkStatus.ForeColor = Color.Gray;
+                    return;
+                }
+                try
+                {
+                    PgpPublicKey k = PurePgp.ParseEncryptionKey(PurePgp.ArmorDecode(t));
+                    lblPkStatus.Text = "已識別：" + k.Describe();
+                    lblPkStatus.ForeColor = Color.ForestGreen;
+                }
+                catch
+                {
+                    lblPkStatus.Text = "尚無法識別（請貼入完整的公鑰文字）";
+                    lblPkStatus.ForeColor = Color.Gray;
+                }
+            };
+
+            lblPkStatus = new Label();
+            lblPkStatus.Text = "貼上後會自動識別金鑰";
+            lblPkStatus.ForeColor = Color.Gray;
+            Place(lblPkStatus, 12, 354, 670, 16);
+
             btnGo = new Button();
             btnGo.Text = "開始加密並簽署";
-            Place(btnGo, 12, 328, 670, 42);
+            Place(btnGo, 12, 368, 670, 42);
             btnGo.Click += BtnGo_Click;
             AcceptButton = btnGo;
 
             progressBar = new ProgressBar();
             progressBar.Minimum = 0;
             progressBar.Maximum = 100;
-            Place(progressBar, 12, 376, 670, 18);
+            Place(progressBar, 12, 418, 670, 18);
 
             Label lblLog = new Label();
             lblLog.Text = "處理紀錄：";
-            Place(lblLog, 12, 400, 670, 20);
+            Place(lblLog, 12, 440, 670, 20);
 
             rtbLog = new RichTextBox();
             rtbLog.ReadOnly = true;
             rtbLog.BackColor = Color.White;
-            Place(rtbLog, 12, 420, 670, 120);
+            Place(rtbLog, 12, 462, 670, 126);
 
             // 處理期間阻擋關閉（加密在背景執行緒進行，強制關閉會留下未完成的管線）
             FormClosing += delegate(object s, FormClosingEventArgs ev)
@@ -1175,17 +2323,23 @@ namespace PGPEncrypt
         private void UpdateModeUi()
         {
             bool pw = cboMode.SelectedIndex == 1;
+            bool pk = cboMode.SelectedIndex == 2;
             bool has7z = Program.SevenZipExe.Length > 0;
             lblComp.Visible = !pw;
             cboComp.Visible = !pw;
             lblKey.Visible = !pw;
-            cboKey.Visible = !pw;
+            cboKey.Visible = !pw && !pk;
+            txtPubKey.Visible = pk;
+            lblPkStatus.Visible = pk;
             lblMx.Visible = pw;
             cboMx.Visible = pw;
             lblPwLen.Visible = pw;
             numPwLen.Visible = pw;
             chkPwName.Visible = pw;
-            btnGo.Text = pw ? "開始加密（7z 密碼）" : "開始加密並簽署";
+            lblKey.Text = pk
+                ? "2. 貼上對方的公鑰（gpg --armor --export 的文字；此模式不簽署）"
+                : "2. 選擇加密對象（公鑰）";
+            btnGo.Text = pw ? "開始加密（7z 密碼）" : (pk ? "開始加密（公鑰明文）" : "開始加密並簽署");
             if (pw && !has7z)
                 Log("找不到 7z.exe。請安裝 7-Zip（或確認 Windows 內建版本存在），否則無法使用密碼模式。", 2);
         }
@@ -1321,6 +2475,7 @@ namespace PGPEncrypt
                 return;
             }
             if (cboMode.SelectedIndex == 1) { BtnGoPw(); return; }
+            if (cboMode.SelectedIndex == 2) { BtnGoPk(); return; }
             string disp = cboKey.SelectedItem as string;
             string rid;
             if (disp == null || !keyMap.TryGetValue(disp, out rid))
@@ -1467,6 +2622,101 @@ namespace PGPEncrypt
                             busy = false;
                             UseWaitCursor = false;
                             btnGo.Enabled = btnAdd.Enabled = btnAddFile.Enabled = btnRemove.Enabled = btnClear.Enabled = chkCombine.Enabled = cboMode.Enabled = cboMx.Enabled = numPwLen.Enabled = chkPwName.Enabled = true;
+                        });
+                    }
+                    catch { }
+                }
+            });
+            worker.IsBackground = true;
+            worker.Start();
+        }
+
+        // 公鑰明文模式：解析貼上的 ASCII-armored 公鑰，由內建模組加密（不呼叫 gpg、不簽署）
+        private void BtnGoPk()
+        {
+            if (inputs.Count == 0)
+            {
+                MessageBox.Show(this, "請先將要加密的資料夾或檔案加入清單。", "提示");
+                return;
+            }
+            PgpPublicKey key;
+            try
+            {
+                key = PurePgp.ParseEncryptionKey(PurePgp.ArmorDecode(txtPubKey.Text));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "公鑰解析失敗：" + ex.Message, "提示");
+                return;
+            }
+            Log("已識別公鑰：" + key.Describe(), 1);
+            string compMode;
+            if (!compMap.TryGetValue(cboComp.SelectedItem as string ?? "", out compMode)) compMode = "xz";
+            string compSuffix = Program.CompSuffix[compMode];
+            string combinedOutput = null;
+            if (chkCombine.Checked)
+            {
+                using (SaveFileDialog dlg = new SaveFileDialog())
+                {
+                    dlg.Title = "選擇合併壓縮檔的輸出位置";
+                    dlg.InitialDirectory = Path.GetDirectoryName(inputs[0]);
+                    dlg.FileName = "合併加密" + compSuffix;
+                    dlg.Filter = "加密壓縮檔 (*" + compSuffix + ")|*" + compSuffix;
+                    dlg.AddExtension = false;
+                    if (dlg.ShowDialog(this) != DialogResult.OK) return;
+                    combinedOutput = Program.GetCombinedOutputPath(dlg.FileName, compMode);
+                }
+            }
+            busy = true;
+            btnGo.Enabled = btnAdd.Enabled = btnAddFile.Enabled = btnRemove.Enabled = btnClear.Enabled = chkCombine.Enabled = cboComp.Enabled = cboMode.Enabled = false;
+            progressBar.Value = 0;
+            UseWaitCursor = true;
+            bool doCombine = chkCombine.Checked;
+            string[] items = inputs.ToArray();
+            System.Threading.Thread worker = new System.Threading.Thread(delegate()
+            {
+                try
+                {
+                    if (doCombine)
+                    {
+                        try
+                        {
+                            Program.PkCombinedCompressEncrypt(items, key, combinedOutput, compMode, LogThreadSafe, SetProgress);
+                            LogThreadSafe("完成：" + combinedOutput, 1);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogThreadSafe("失敗：" + ex.Message, 2);
+                        }
+                    }
+                    else
+                    {
+                        foreach (string p in items)
+                        {
+                            try
+                            {
+                                string outp = Program.GetOutputPath(p, compMode);
+                                Program.PkEncryptInput(p, key, outp, compMode, LogThreadSafe, SetProgress);
+                                LogThreadSafe("完成：" + outp, 1);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogThreadSafe("失敗：" + ex.Message, 2);
+                            }
+                        }
+                    }
+                    LogThreadSafe("全部處理完畢（注意：公鑰明文模式不簽署）。", 1);
+                }
+                finally
+                {
+                    SetProgress(100);
+                    try
+                    {
+                        BeginInvoke((Action)delegate
+                        {
+                            busy = false;
+                            UseWaitCursor = false;
+                            btnGo.Enabled = btnAdd.Enabled = btnAddFile.Enabled = btnRemove.Enabled = btnClear.Enabled = chkCombine.Enabled = cboComp.Enabled = cboMode.Enabled = true;
                         });
                     }
                     catch { }

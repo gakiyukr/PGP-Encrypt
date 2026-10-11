@@ -8,5 +8,5 @@ if not exist "%CSC%" (
   echo csc.exe not found. .NET Framework 4.x is required.
   exit /b 1
 )
-"%CSC%" /nologo /target:winexe /platform:anycpu /out:"%~dp0PGPEncrypt.exe" /r:System.dll /r:System.Core.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll "%~dp0EncryptTool.cs"
+"%CSC%" /nologo /target:winexe /platform:anycpu /out:"%~dp0PGPEncrypt.exe" /r:System.dll /r:System.Core.dll /r:System.Numerics.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll "%~dp0EncryptTool.cs"
 exit /b %ERRORLEVEL%
